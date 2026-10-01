@@ -1,0 +1,56 @@
+# Jutsu Security: the reusable workflow a repository's .github/workflows/jutsu-security.yml calls.
+#
+# Released by scripts/github-scan-release.ts --stage-b (jutsu-siem, apps/github-scan-action) as
+# commit B of a release: the two `uses:` lines pin the actions at the full SHA of commit A, the
+# commit that holds actions/ and dist/. Customers pin commit B. Do not edit the released copy by
+# hand.
+#
+# Two jobs, so the identity token never shares a job with the code that parses the repository:
+#   scan    reads the repository with the run's read-only token and has no identity token;
+#   report  has the identity token and no access to the repository. It runs whatever scan's
+#           result was, and reports a failure envelope when scan did not succeed.
+name: Jutsu Security scan
+
+on:
+  workflow_call:
+    inputs:
+      api:
+        description: The Jutsu API base URL. Also the audience of the report's identity token.
+        type: string
+        required: false
+        default: https://api.jutsu.ai
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      report_0: ${{ steps.scan.outputs.report_0 }}
+      report_1: ${{ steps.scan.outputs.report_1 }}
+      report_2: ${{ steps.scan.outputs.report_2 }}
+      report_3: ${{ steps.scan.outputs.report_3 }}
+    steps:
+      - name: Scan the commits under review
+        id: scan
+        uses: jutsuai/code-security/actions/scan@194fc47cda48d474ef46b1c564c96c33b071ae0b
+
+  report:
+    needs: scan
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+    steps:
+      - name: Send the report to Jutsu
+        uses: jutsuai/code-security/actions/report@194fc47cda48d474ef46b1c564c96c33b071ae0b
+        with:
+          api: ${{ inputs.api }}
+        env:
+          JUTSU_SCAN_RESULT: ${{ needs.scan.result }}
+          JUTSU_REPORT_0: ${{ needs.scan.outputs.report_0 }}
+          JUTSU_REPORT_1: ${{ needs.scan.outputs.report_1 }}
+          JUTSU_REPORT_2: ${{ needs.scan.outputs.report_2 }}
+          JUTSU_REPORT_3: ${{ needs.scan.outputs.report_3 }}

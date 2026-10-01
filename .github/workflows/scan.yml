@@ -14,6 +14,13 @@ name: Jutsu Security scan
 on:
   workflow_call:
     inputs:
+      report_key:
+        description: >-
+          Jutsu's public key for this repository's Jutsu environment (44 characters of base64). The
+          scan job encrypts its findings to it before they leave the job, so the run log and the
+          report job only ever hold ciphertext.
+        type: string
+        required: true
       api:
         description: The Jutsu API base URL. Also the audience of the report's identity token.
         type: string
@@ -34,7 +41,9 @@ jobs:
     steps:
       - name: Scan the commits under review
         id: scan
-        uses: jutsuai/code-security/actions/scan@194fc47cda48d474ef46b1c564c96c33b071ae0b
+        uses: jutsuai/code-security/actions/scan@3d84fbd08f81daec579e2c5a4bee3a01fd219c1e
+        with:
+          report_key: ${{ inputs.report_key }}
 
   report:
     needs: scan
@@ -45,7 +54,7 @@ jobs:
       id-token: write
     steps:
       - name: Send the report to Jutsu
-        uses: jutsuai/code-security/actions/report@194fc47cda48d474ef46b1c564c96c33b071ae0b
+        uses: jutsuai/code-security/actions/report@3d84fbd08f81daec579e2c5a4bee3a01fd219c1e
         with:
           api: ${{ inputs.api }}
         env:

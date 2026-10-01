@@ -5674,9 +5674,9 @@ async function scanJob(env, io = {}) {
     log("Jutsu Security: GITHUB_REPOSITORY is not <owner>/<repository>.");
     return 1;
   }
-  const reportKey = parseReportPublicKey(env.INPUT_REPORT_KEY);
+  const reportKey = parseReportPublicKey(env.INPUT_ENCRYPT_TO);
   if (reportKey === null) {
-    log("Jutsu Security: the report_key input is missing or is not a 32-byte base64 key. " + "Use the workflow file from the Jutsu console unchanged; nothing was scanned.");
+    log("Jutsu Security: the encrypt_to input is missing or is not a 32-byte base64 public key. " + "Use the workflow file from the Jutsu console unchanged; nothing was scanned.");
     return 1;
   }
   const run = { repositoryId: env.GITHUB_REPOSITORY_ID ?? "", runId: env.GITHUB_RUN_ID ?? "" };

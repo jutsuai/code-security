@@ -5,7 +5,7 @@ description: >-
   report job, compressed and encrypted to Jutsu's public key, so the run log shows only ciphertext.
   Source code and secret values never leave the runner.
 inputs:
-  report_key:
+  encrypt_to:
     description: Jutsu's public key (44 characters of base64). The output is encrypted to it.
     required: true
   token:

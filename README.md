@@ -23,10 +23,10 @@ jobs:
       id-token: write    # the report proves which workflow produced it
     uses: jutsuai/code-security/.github/workflows/scan.yml@<40-character commit SHA>
     with:
-      report_key: "<44-character public key>"   # findings are encrypted to this Jutsu key before they leave the scan job
+      encrypt_to: "<44-character public key>"   # Jutsu's public key: findings are encrypted to it before they leave the scan job
 ```
 
-It passes no secrets. `report_key` is a PUBLIC key: anyone may read it, and only Jutsu holds the
+It passes no secrets. `encrypt_to` is a PUBLIC key: anyone may read it, and only Jutsu holds the
 private half. Use the file from the Jutsu console unchanged: Jutsu accepts reports only from the
 releases it lists, and can only open findings encrypted to its own key.
 
@@ -50,7 +50,7 @@ The workflow has two jobs.
    *introduced* when the head has it and the base does not;
 4. replaces each secret value with its SHA-256 digest, drops the value, and discards the tools'
    own output, so a secret a tool prints never reaches the run's log;
-5. compresses the result (identifiers only) and encrypts it to `report_key`, bound to this
+5. compresses the result (identifiers only) and encrypts it to the `encrypt_to` key, bound to this
    repository and run, and passes that to the report job. The job output, which GitHub shows in the
    run log, is ciphertext.
 

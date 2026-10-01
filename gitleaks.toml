@@ -1,0 +1,42 @@
+# Jutsu Security: the Gitleaks configuration the scan job passes with --config.
+#
+# This file is the authority for which rule ids a release ships (implementation plan C11):
+# scripts/github-scan-release.ts reads the ids below, adds the default rule set of the pinned
+# Gitleaks version (tools.json, gitleaks.defaultConfig), and writes them into the release's
+# `ruleIds`. The API refuses a report naming a rule id outside that list, and every id needs a
+# title in packages/github/src/scan/rules.ts (SECRET_RULE_TITLES).
+#
+# A repository's own .gitleaks.toml, .gitleaksignore and gitleaks:allow comments are inert: the
+# scan passes this file explicitly, an empty ignore file and --ignore-gitleaks-allow.
+
+title = "Jutsu Security"
+
+[extend]
+useDefault = true
+
+# Jutsu's own credentials: a prefix and 32 url-safe characters (24 random bytes, base64url),
+# as apps/api mints them. The trailing group keeps a longer token from matching its first 32.
+
+[[rules]]
+id = "jutsu-collector-key"
+description = "Jutsu collector key (jcol_)"
+regex = '''\b(jcol_[A-Za-z0-9_-]{32})(?:[^A-Za-z0-9_-]|$)'''
+secretGroup = 1
+entropy = 3.5
+keywords = ["jcol_"]
+
+[[rules]]
+id = "jutsu-api-key"
+description = "Jutsu API key (japi_)"
+regex = '''\b(japi_[A-Za-z0-9_-]{32})(?:[^A-Za-z0-9_-]|$)'''
+secretGroup = 1
+entropy = 3.5
+keywords = ["japi_"]
+
+[[rules]]
+id = "jutsu-key"
+description = "Jutsu key (jk_)"
+regex = '''\b(jk_[A-Za-z0-9_-]{32,64})(?:[^A-Za-z0-9_-]|$)'''
+secretGroup = 1
+entropy = 3.5
+keywords = ["jk_"]

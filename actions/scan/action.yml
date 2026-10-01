@@ -1,0 +1,22 @@
+name: Jutsu Security scan
+description: >-
+  Scans the commits under review for secrets (Gitleaks) and vulnerable dependencies (osv-scanner)
+  on this runner. It sends nothing anywhere: its only output is a compressed list of identifiers
+  for the report job. Source code and secret values never leave the runner.
+inputs:
+  token:
+    description: The run's own read-only token, used to fetch the commits under review.
+    required: false
+    default: ${{ github.token }}
+outputs:
+  report_0:
+    description: The scan output, gzip and base64, part 1 of at most 4.
+  report_1:
+    description: The scan output, part 2.
+  report_2:
+    description: The scan output, part 3.
+  report_3:
+    description: The scan output, part 4.
+runs:
+  using: node24
+  main: ../../dist/scan.js

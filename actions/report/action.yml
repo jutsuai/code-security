@@ -1,0 +1,13 @@
+name: Jutsu Security report
+description: >-
+  Sends the scan job's output to Jutsu, signed with the run's GitHub identity token. It has no
+  access to the repository. It reads the scan job's result and outputs from the environment
+  (JUTSU_SCAN_RESULT, JUTSU_REPORT_0 to JUTSU_REPORT_3).
+inputs:
+  api:
+    description: The Jutsu API base URL. Also the audience of the identity token.
+    required: false
+    default: https://api.jutsu.ai
+runs:
+  using: node24
+  main: ../../dist/report.js

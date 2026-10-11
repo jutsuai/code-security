@@ -3,6 +3,68 @@ var import_node_fs5 = require("node:fs");
 var import_node_os = require("node:os");
 var import_node_path3 = require("node:path");
 
+// packages/github/src/scan/seal.ts
+var import_node_crypto = require("node:crypto");
+var SEAL_VERSION = 1;
+var INFO = "jutsu-code-scan-report-v1";
+var KID_BYTES = 8;
+var PUBLIC_BYTES = 32;
+var NONCE_BYTES = 12;
+var TAG_BYTES = 16;
+var SEAL_OVERHEAD_BYTES = 1 + KID_BYTES + PUBLIC_BYTES + NONCE_BYTES + TAG_BYTES;
+var SPKI_PREFIX = Buffer.from("302a300506032b656e032100", "hex");
+var PUBLIC_KEY_B64 = /^[A-Za-z0-9+/]{43}=$/;
+function isAllZero(bytes) {
+  return bytes.every((b) => b === 0);
+}
+function kidOf(rawPublic) {
+  return import_node_crypto.createHash("sha256").update(rawPublic).digest().subarray(0, KID_BYTES).toString("hex");
+}
+function rawPublicOf(key) {
+  return Buffer.from(key.export({ format: "der", type: "spki" })).subarray(-PUBLIC_BYTES);
+}
+function parseReportPublicKey(b64) {
+  if (typeof b64 !== "string" || !PUBLIC_KEY_B64.test(b64))
+    return null;
+  const raw = Buffer.from(b64, "base64");
+  if (raw.length !== PUBLIC_BYTES || raw.toString("base64") !== b64)
+    return null;
+  try {
+    const key = import_node_crypto.createPublicKey({ key: Buffer.concat([SPKI_PREFIX, raw]), format: "der", type: "spki" });
+    const probe = import_node_crypto.diffieHellman({ privateKey: import_node_crypto.generateKeyPairSync("x25519").privateKey, publicKey: key });
+    if (isAllZero(probe))
+      return null;
+    return { raw, kid: kidOf(raw), key };
+  } catch {
+    return null;
+  }
+}
+function sealAad(run) {
+  return `${run.repositoryId}:${run.runId}`;
+}
+function derive(shared, ephemeralPublic, recipientPublic) {
+  if (shared.length !== 32 || isAllZero(shared))
+    throw new Error("seal: a low-order public key");
+  return Buffer.from(import_node_crypto.hkdfSync("sha256", shared, Buffer.concat([ephemeralPublic, recipientPublic]), INFO, 32));
+}
+function seal(plaintext, recipient, aad) {
+  const ephemeral = import_node_crypto.generateKeyPairSync("x25519");
+  const ephemeralPublic = rawPublicOf(ephemeral.publicKey);
+  const key = derive(import_node_crypto.diffieHellman({ privateKey: ephemeral.privateKey, publicKey: recipient.key }), ephemeralPublic, recipient.raw);
+  const nonce = import_node_crypto.randomBytes(NONCE_BYTES);
+  const cipher = import_node_crypto.createCipheriv("aes-256-gcm", key, nonce);
+  cipher.setAAD(Buffer.from(aad, "utf8"));
+  const body = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return Buffer.concat([
+    Buffer.from([SEAL_VERSION]),
+    Buffer.from(recipient.kid, "hex"),
+    ephemeralPublic,
+    nonce,
+    body,
+    cipher.getAuthTag()
+  ]);
+}
+
 // packages/github/src/scan/report.ts
 var import_node_zlib = require("node:zlib");
 
@@ -3939,8 +4001,14 @@ var ReportIdentity = discriminatedUnionType("event", [
   }
 });
 var Report = objectType({ identity: ReportIdentity, scan: unionType([ScanOutput, FailureEnvelope]) }).strict();
-function encodeScanOutput(json) {
-  const encoded = import_node_zlib.gzipSync(Buffer.from(json, "utf8")).toString("base64");
+var SealedScan = stringType().min(1).max(LIMITS.maxChunkChars * LIMITS.maxChunks).regex(/^[A-Za-z0-9+/]*={0,2}$/);
+var WireReport = unionType([
+  objectType({ identity: ReportIdentity, sealed: SealedScan }).strict(),
+  objectType({ identity: ReportIdentity, scan: FailureEnvelope }).strict()
+]);
+function encodeScanOutput(json, sealer) {
+  const gzipped = import_node_zlib.gzipSync(Buffer.from(json, "utf8"));
+  const encoded = (sealer ? sealer(gzipped) : gzipped).toString("base64");
   const chunks = [];
   for (let i = 0;i < encoded.length; i += LIMITS.maxChunkChars) {
     chunks.push(encoded.slice(i, i + LIMITS.maxChunkChars));
@@ -3949,39 +4017,6 @@ function encodeScanOutput(json) {
     throw new RangeError(`scan output needs ${chunks.length} chunks, more than ${LIMITS.maxChunks}`);
   }
   return chunks;
-}
-var BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
-function decodeScanOutput(chunks) {
-  if (!Array.isArray(chunks))
-    return { ok: false, reason: "corrupt" };
-  if (chunks.length > LIMITS.maxChunks)
-    return { ok: false, reason: "too_large" };
-  for (const c of chunks) {
-    if (typeof c !== "string")
-      return { ok: false, reason: "corrupt" };
-    if (c.length > LIMITS.maxChunkChars)
-      return { ok: false, reason: "too_large" };
-  }
-  const encoded = chunks.join("");
-  if (encoded.length === 0 || encoded.length % 4 !== 0 || !BASE64.test(encoded)) {
-    return { ok: false, reason: "corrupt" };
-  }
-  let out;
-  try {
-    out = import_node_zlib.gunzipSync(Buffer.from(encoded, "base64"), { maxOutputLength: LIMITS.maxDecompressedBytes });
-  } catch (err) {
-    const code = err?.code;
-    if (err instanceof RangeError || code === "ERR_BUFFER_TOO_LARGE")
-      return { ok: false, reason: "too_large" };
-    return { ok: false, reason: "corrupt" };
-  }
-  if (out.length > LIMITS.maxDecompressedBytes)
-    return { ok: false, reason: "too_large" };
-  try {
-    return { ok: true, json: new TextDecoder("utf-8", { fatal: true }).decode(out) };
-  } catch {
-    return { ok: false, reason: "corrupt" };
-  }
 }
 
 // apps/github-scan-action/src/event.ts
@@ -4452,7 +4487,7 @@ var import_node_fs4 = require("node:fs");
 var import_node_path2 = require("node:path");
 
 // apps/github-scan-action/src/gitleaks.ts
-var import_node_crypto = require("node:crypto");
+var import_node_crypto2 = require("node:crypto");
 var GITLEAKS_TIMEOUT_S = 600;
 var MERGE_DIFF_OPTION = "--diff-merges=remerge";
 function commonArgs(configPath, reportPath) {
@@ -4526,7 +4561,7 @@ function treeRelativePath(file, prefixes) {
   return null;
 }
 function digestSecret(value) {
-  return import_node_crypto.createHash("sha256").update(value, "utf8").digest("hex");
+  return import_node_crypto2.createHash("sha256").update(value, "utf8").digest("hex");
 }
 function toSecretFinding(raw, inHeadTree) {
   const candidate = {
@@ -4794,12 +4829,12 @@ var DEFAULT_BUDGET = {
   maxJsonBytes: LIMITS.maxBodyBytes - IDENTITY_HEADROOM_BYTES,
   maxEncodedChars: LIMITS.maxChunkChars * LIMITS.maxChunks
 };
-function encodeWithin(json, budget) {
+function encodeWithin(json, budget, sealer) {
   if (Buffer.byteLength(json, "utf8") > budget.maxJsonBytes)
     return null;
   let chunks;
   try {
-    chunks = encodeScanOutput(json);
+    chunks = encodeScanOutput(json, sealer);
   } catch (err) {
     if (err instanceof RangeError)
       return null;
@@ -4824,7 +4859,7 @@ function dropFindings(o, tool) {
     findings: []
   } };
 }
-function fitBudget(output, budget = DEFAULT_BUDGET) {
+function fitBudget(output, sealer, budget = DEFAULT_BUDGET) {
   const shed = [];
   let o = output;
   const steps = [
@@ -4861,7 +4896,7 @@ function fitBudget(output, budget = DEFAULT_BUDGET) {
       throw new Error(`the scan output does not validate (${where})`);
     }
     const json = JSON.stringify(o);
-    const chunks = encodeWithin(json, budget);
+    const chunks = encodeWithin(json, budget, sealer);
     if (chunks !== null)
       return { output: o, json, chunks, shed };
     let applied = false;
@@ -4877,7 +4912,7 @@ function fitBudget(output, budget = DEFAULT_BUDGET) {
 }
 
 // apps/github-scan-action/src/tools.ts
-var import_node_crypto2 = require("node:crypto");
+var import_node_crypto3 = require("node:crypto");
 var import_node_fs3 = require("node:fs");
 var import_node_zlib2 = require("node:zlib");
 var PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"];
@@ -4944,7 +4979,7 @@ function platformKey(platform = process.platform, arch = process.arch) {
   return PLATFORMS.includes(key) ? key : null;
 }
 function sha256Hex(bytes) {
-  return import_node_crypto2.createHash("sha256").update(bytes).digest("hex");
+  return import_node_crypto3.createHash("sha256").update(bytes).digest("hex");
 }
 function extractTarGzMember(archive, member) {
   let tar;
@@ -5565,7 +5600,7 @@ class Scan {
     });
   }
   finish(plan, parts) {
-    const fitted = fitBudget(buildScanOutput(parts), this.deps.budget);
+    const fitted = fitBudget(buildScanOutput(parts), this.deps.sealer, this.deps.budget);
     if (fitted.shed.length > 0)
       this.deps.log(`Output over budget; shed: ${fitted.shed.join(", ")}`);
     return { ...fitted, plan };
@@ -5612,6 +5647,7 @@ function githubCompare(o) {
 
 // apps/github-scan-action/src/scanJob.ts
 var REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+var DECIMAL = /^[1-9]\d{0,19}$/;
 async function scanJob(env, io = {}) {
   const log = io.log ?? ((line) => {
     process.stdout.write(`${line}
@@ -5638,6 +5674,17 @@ async function scanJob(env, io = {}) {
     log("Jutsu Security: GITHUB_REPOSITORY is not <owner>/<repository>.");
     return 1;
   }
+  const reportKey = parseReportPublicKey(env.INPUT_ENCRYPT_TO);
+  if (reportKey === null) {
+    log("Jutsu Security: the encrypt_to input is missing or is not a 32-byte base64 public key. " + "Use the workflow file from the Jutsu console unchanged; nothing was scanned.");
+    return 1;
+  }
+  const run = { repositoryId: env.GITHUB_REPOSITORY_ID ?? "", runId: env.GITHUB_RUN_ID ?? "" };
+  if (!DECIMAL.test(run.repositoryId) || !DECIMAL.test(run.runId)) {
+    log("Jutsu Security: GITHUB_REPOSITORY_ID or GITHUB_RUN_ID is not set; nothing was scanned.");
+    return 1;
+  }
+  const aad = sealAad(run);
   const root = io.actionRoot ?? import_node_path3.resolve(import_node_path3.dirname(process.argv[1] ?? "."), "..");
   const tools = parseToolsManifest(JSON.parse(import_node_fs5.readFileSync(import_node_path3.join(root, "tools.json"), "utf8")));
   const server = (env.GITHUB_SERVER_URL ?? "https://github.com").replace(/\/+$/, "");
@@ -5646,7 +5693,7 @@ async function scanJob(env, io = {}) {
     log(`::add-mask::${basicAuthValue(token).slice("basic ".length)}`);
   }
   const fetchImpl = io.fetch ?? fetch;
-  const run = await runScan({
+  const scanned = await runScan({
     target,
     remoteUrl: io.remoteUrl ?? `${server}/${repository}`,
     auth: token.length > 0 ? { serverUrl: server, token } : null,
@@ -5660,12 +5707,13 @@ async function scanJob(env, io = {}) {
     fetch: fetchImpl,
     compare: io.compare ?? githubCompare({ apiUrl: env.GITHUB_API_URL ?? "https://api.github.com", repository, token, fetchImpl }),
     now: () => new Date,
-    log
+    log,
+    sealer: (gzipped) => seal(gzipped, reportKey, aad)
   });
-  import_node_fs5.appendFileSync(outputFile, run.chunks.map((c, i) => `report_${i}=${c}
+  import_node_fs5.appendFileSync(outputFile, scanned.chunks.map((c, i) => `report_${i}=${c}
 `).join(""));
-  const o = run.output;
-  log(`Jutsu Security: secrets ${describeCoverage(o.secrets)}, ${o.secrets.findings.length} finding(s); ` + `dependencies ${describeCoverage({ coverage: o.vulnerabilities.coverage.head, reason: o.vulnerabilities.reason.head })}, ` + `${o.vulnerabilities.findings.length} finding(s). The report job sends identifiers only.`);
+  const o = scanned.output;
+  log(`Jutsu Security: secrets ${describeCoverage(o.secrets)}, ${o.secrets.findings.length} finding(s); ` + `dependencies ${describeCoverage({ coverage: o.vulnerabilities.coverage.head, reason: o.vulnerabilities.reason.head })}, ` + `${o.vulnerabilities.findings.length} finding(s). The result is encrypted to Jutsu's key (${reportKey.kid}) ` + "before it leaves this job; the report job forwards it without reading it.");
   return 0;
 }
 

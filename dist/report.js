@@ -3940,8 +3940,14 @@ var ReportIdentity = discriminatedUnionType("event", [
   }
 });
 var Report = objectType({ identity: ReportIdentity, scan: unionType([ScanOutput, FailureEnvelope]) }).strict();
-function encodeScanOutput(json) {
-  const encoded = import_node_zlib.gzipSync(Buffer.from(json, "utf8")).toString("base64");
+var SealedScan = stringType().min(1).max(LIMITS.maxChunkChars * LIMITS.maxChunks).regex(/^[A-Za-z0-9+/]*={0,2}$/);
+var WireReport = unionType([
+  objectType({ identity: ReportIdentity, sealed: SealedScan }).strict(),
+  objectType({ identity: ReportIdentity, scan: FailureEnvelope }).strict()
+]);
+function encodeScanOutput(json, sealer) {
+  const gzipped = import_node_zlib.gzipSync(Buffer.from(json, "utf8"));
+  const encoded = (sealer ? sealer(gzipped) : gzipped).toString("base64");
   const chunks = [];
   for (let i = 0;i < encoded.length; i += LIMITS.maxChunkChars) {
     chunks.push(encoded.slice(i, i + LIMITS.maxChunkChars));
@@ -3950,39 +3956,6 @@ function encodeScanOutput(json) {
     throw new RangeError(`scan output needs ${chunks.length} chunks, more than ${LIMITS.maxChunks}`);
   }
   return chunks;
-}
-var BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
-function decodeScanOutput(chunks) {
-  if (!Array.isArray(chunks))
-    return { ok: false, reason: "corrupt" };
-  if (chunks.length > LIMITS.maxChunks)
-    return { ok: false, reason: "too_large" };
-  for (const c of chunks) {
-    if (typeof c !== "string")
-      return { ok: false, reason: "corrupt" };
-    if (c.length > LIMITS.maxChunkChars)
-      return { ok: false, reason: "too_large" };
-  }
-  const encoded = chunks.join("");
-  if (encoded.length === 0 || encoded.length % 4 !== 0 || !BASE64.test(encoded)) {
-    return { ok: false, reason: "corrupt" };
-  }
-  let out;
-  try {
-    out = import_node_zlib.gunzipSync(Buffer.from(encoded, "base64"), { maxOutputLength: LIMITS.maxDecompressedBytes });
-  } catch (err) {
-    const code = err?.code;
-    if (err instanceof RangeError || code === "ERR_BUFFER_TOO_LARGE")
-      return { ok: false, reason: "too_large" };
-    return { ok: false, reason: "corrupt" };
-  }
-  if (out.length > LIMITS.maxDecompressedBytes)
-    return { ok: false, reason: "too_large" };
-  try {
-    return { ok: true, json: new TextDecoder("utf-8", { fatal: true }).decode(out) };
-  } catch {
-    return { ok: false, reason: "corrupt" };
-  }
 }
 
 // apps/github-scan-action/src/event.ts
@@ -4113,22 +4086,15 @@ var REPORT_ROUTE = "/api/v1/public/github/code-scan/reports";
 var POST_DEADLINE_MS = 10 * 60 * 1000;
 var ATTEMPT_TIMEOUT_MS = 30000;
 function scanPartFrom(result, chunks) {
-  const envelope = (scanResult, note) => ({ scan: { version: REPORT_VERSION, scanResult }, note });
+  const envelope = (scanResult, note) => ({ part: { scan: { version: REPORT_VERSION, scanResult } }, note });
   switch (result) {
     case "success": {
-      const decoded = decodeScanOutput([...chunks]);
-      if (!decoded.ok)
-        return envelope("failure", `the scan output could not be decoded (${decoded.reason})`);
-      let data;
-      try {
-        data = JSON.parse(decoded.json);
-      } catch {
-        return envelope("failure", "the scan output is not JSON");
-      }
-      const parsed = ScanOutput.safeParse(data);
-      if (!parsed.success)
-        return envelope("failure", "the scan output does not validate");
-      return { scan: parsed.data, note: null };
+      const sealed = chunks.join("");
+      if (sealed.length === 0)
+        return envelope("failure", "the scan job succeeded but left no output");
+      if (!SealedScan.safeParse(sealed).success)
+        return envelope("failure", "the scan output is not base64 within the size limit");
+      return { part: { sealed }, note: null };
     }
     case "failure":
     case "cancelled":
@@ -4234,7 +4200,8 @@ async function postReport(api, body, deps, deadlineMs = POST_DEADLINE_MS) {
         const reason = typeof parsed.reason === "string" && REASON.test(parsed.reason) ? parsed.reason : null;
         if (res.ok) {
           const reportId = typeof parsed.reportId === "string" ? oneLine(parsed.reportId, 64) : null;
-          return { ok: true, attempts: attempt, reportId, consoleUrl: consoleUrlFor(api, parsed) };
+          const problem = typeof parsed.problem === "string" && REASON.test(parsed.problem) ? parsed.problem : null;
+          return { ok: true, attempts: attempt, reportId, consoleUrl: consoleUrlFor(api, parsed), problem };
         }
         lastStatus = res.status;
         lastReason = reason;
@@ -4311,14 +4278,14 @@ async function reportJob(env, io = {}) {
     return 0;
   }
   const chunks = [0, 1, 2, 3].map((i) => env[`JUTSU_REPORT_${i}`] ?? "");
-  let { scan, note } = scanPartFrom(env.JUTSU_SCAN_RESULT, chunks);
-  if (!Report.safeParse({ identity: identity.identity, scan }).success) {
-    scan = { version: REPORT_VERSION, scanResult: "failure" };
+  let { part, note } = scanPartFrom(env.JUTSU_SCAN_RESULT, chunks);
+  if (!WireReport.safeParse({ identity: identity.identity, ...part }).success) {
+    part = { scan: { version: REPORT_VERSION, scanResult: "failure" } };
     note = "the report does not validate";
   }
   if (note !== null)
     log(`Jutsu Security: sending a failure report: ${note}.`);
-  const outcome = await postReport(api, JSON.stringify({ identity: identity.identity, scan }), {
+  const outcome = await postReport(api, JSON.stringify({ identity: identity.identity, ...part }), {
     http,
     token: async () => {
       const t = await requestIdToken(env, api, http);
@@ -4333,6 +4300,11 @@ async function reportJob(env, io = {}) {
   if (outcome.ok) {
     const id = outcome.reportId === null ? "" : ` (report ${outcome.reportId})`;
     const link = outcome.consoleUrl === null ? "" : ` Results: ${outcome.consoleUrl}`;
+    if (outcome.problem !== null) {
+      log(`::warning title=Jutsu Security::Jutsu could not read this run's scan output (${outcome.problem}) and recorded the scan as failed${id}.`);
+      summary(env, `Jutsu Security: Jutsu could not read this run's scan output (${outcome.problem}) and recorded the scan as failed${id}.${link}`);
+      return 0;
+    }
     log(`Jutsu Security: the report was sent${id}.`);
     summary(env, `Jutsu Security: the report was sent${id}.${link}`);
     return 0;
@@ -4341,6 +4313,12 @@ async function reportJob(env, io = {}) {
     log(`::warning title=Jutsu Security::Jutsu is not scanning this repository (${outcome.reason}). Nothing was sent.`);
     summary(env, `Jutsu Security: Jutsu is not scanning this repository (${outcome.reason}), so nothing was sent.`);
     return 0;
+  }
+  if (outcome.status === 400 && outcome.reason === "unknown_report_key") {
+    const fix = "Replace .github/workflows/jutsu-security.yml with the file shown in the Jutsu console, then run the workflow again.";
+    log(`::error title=Jutsu Security::The workflow file names a report key Jutsu no longer accepts. ${fix}`);
+    summary(env, `Jutsu Security: the report was not accepted: the workflow file names a report key Jutsu no longer accepts. ${fix}`);
+    return 1;
   }
   const why = outcome.status === null ? "Jutsu could not be reached" : `HTTP ${outcome.status}${outcome.reason === null ? "" : `, ${outcome.reason}`}`;
   summary(env, `Jutsu Security: the report was not sent (${why}). Re-run the workflow to try again.`);

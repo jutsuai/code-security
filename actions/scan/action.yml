@@ -1,16 +1,20 @@
 name: Jutsu Security scan
 description: >-
   Scans the commits under review for secrets (Gitleaks) and vulnerable dependencies (osv-scanner)
-  on this runner. It sends nothing anywhere: its only output is a compressed list of identifiers
-  for the report job. Source code and secret values never leave the runner.
+  on this runner. It sends nothing anywhere: its only output is a list of identifiers for the
+  report job, compressed and encrypted to Jutsu's public key, so the run log shows only ciphertext.
+  Source code and secret values never leave the runner.
 inputs:
+  encrypt_to:
+    description: Jutsu's public key (44 characters of base64). The output is encrypted to it.
+    required: true
   token:
     description: The run's own read-only token, used to fetch the commits under review.
     required: false
     default: ${{ github.token }}
 outputs:
   report_0:
-    description: The scan output, gzip and base64, part 1 of at most 4.
+    description: The scan output, encrypted and base64, part 1 of at most 4.
   report_1:
     description: The scan output, part 2.
   report_2:
